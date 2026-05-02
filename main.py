@@ -1,11 +1,15 @@
 import argparse
 import logging
 from typing import Callable, Literal, Annotated
+
+import httpx
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from mcp.server.fastmcp import FastMCP
 from copr.v3 import Client
 
+LOG_FILE = "builder-live.log.gz"
+LOG_TAIL_LINES = 500
 
 class Project(BaseModel):
     id: int
@@ -26,6 +30,12 @@ class Build(BaseModel):
     web_url: str
     state: str
     submitter: str
+
+
+class BuildChrootLog(BaseModel):
+    chroot: str
+    state: str
+    log_url: str | None = None
 
 
 class BuildFromDistGit(BaseModel):
@@ -207,6 +217,64 @@ def copr_list_mock_chroots_for_project(ownername: str, projectname:str) -> list[
     return list(project['chroot_repos'].keys())
 
 
+def copr_get_build_log_url(build_id: int) -> list[BuildChrootLog]:
+    """
+    Returns all build chroots for a build with their state and url to the
+    log file.
+    """
+    log.debug("copr_get_build_log_url: %s", build_id)
+    client = Client.create_from_config_file()
+    chroots = client.build_chroot_proxy.get_list(build_id)
+    return [
+        BuildChrootLog(
+            chroot=chroot.name,
+            state=chroot.state,
+            log_url=(
+                f"{result_url.rstrip('/')}/{LOG_FILE}"
+                if (result_url := getattr(chroot, "result_url", None))
+                else None
+            ),
+        )
+        for chroot in chroots
+    ]
+
+
+def _fetch_log_content(log_url: str) -> str:
+    """Fetch log content from URL."""
+    response = httpx.get(log_url, follow_redirects=True, timeout=30)
+    response.raise_for_status()
+    return response.content.decode("utf-8", errors="replace")
+
+
+def _format_log_output(text: str, max_lines: int = LOG_TAIL_LINES) -> str:
+    """Format log output to only show the last max_lines"""
+    lines = text.splitlines()
+
+    if len(lines) <= max_lines:
+        return text
+
+    omitted = len(lines) - max_lines
+    return (
+        f"[Truncated: {omitted} lines omitted, showing last {max_lines}]\n"
+        + "\n".join(lines[-max_lines:])
+    )
+
+
+def copr_get_build_log(log_url: str | None) -> str:
+    """
+    Fetch and return the decompressed text content of a builder-live.log.gz
+    file given its URL.
+    """
+    if not log_url:
+        return (
+            "No log URL available. "
+            "The build chroot may not have started yet."
+        )
+
+    log.debug("copr_get_build_log: %s", log_url)
+    return _format_log_output(_fetch_log_content(log_url))
+
+
 def run_mcp(tools: list[Callable], args):
     mcp = FastMCP("copr")
     for tool in tools:
@@ -251,6 +319,8 @@ def main():
         copr_enable_repository,
         copr_list_mock_chroots,
         copr_list_mock_chroots_for_project,
+        copr_get_build_log_url,
+        copr_get_build_log,
         # We probably don't have to implement wrappers around every python-copr
         # function. We can simply register the client methods like this.
         client.base_proxy.auth_check,
