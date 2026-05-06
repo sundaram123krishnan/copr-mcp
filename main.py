@@ -8,8 +8,12 @@ from pydantic_ai import Agent
 from mcp.server.fastmcp import FastMCP
 from copr.v3 import Client
 
-LOG_FILE = "builder-live.log.gz"
+COPR_DIST_GIT_LOGS_URL = (
+    "https://copr-dist-git.fedorainfracloud.org/per-task-logs"
+)
+LOG_FILES = ("builder-live.log.gz", "backend.log.gz")
 LOG_TAIL_LINES = 500
+
 
 class Project(BaseModel):
     id: int
@@ -32,10 +36,11 @@ class Build(BaseModel):
     submitter: str
 
 
-class BuildChrootLog(BaseModel):
-    chroot: str
-    state: str
-    log_url: str | None = None
+class Log(BaseModel):
+    """
+    Copr `builder-live.log`, `backend.log`, or `import.log`
+    """
+    url: str | None = None
 
 
 class BuildFromDistGit(BaseModel):
@@ -217,32 +222,42 @@ def copr_list_mock_chroots_for_project(ownername: str, projectname:str) -> list[
     return list(project['chroot_repos'].keys())
 
 
-def copr_get_build_log_url(build_id: int) -> list[BuildChrootLog]:
+def copr_get_build_log_url(build_id: int) -> list[Log]:
     """
-    Returns all build chroots for a build with their state and url to the
-    log file.
+    Returns all log URLs for a Copr build, covering the SRPM builds, the
+    dist-git import, and each per-chroot build.
     """
     log.debug("copr_get_build_log_url: %s", build_id)
     client = Client.create_from_config_file()
     chroots = client.build_chroot_proxy.get_list(build_id)
-    return [
-        BuildChrootLog(
-            chroot=chroot.name,
-            state=chroot.state,
-            log_url=(
-                f"{result_url.rstrip('/')}/{LOG_FILE}"
-                if (result_url := getattr(chroot, "result_url", None))
-                else None
-            ),
+    srpm_log_url = client.build_proxy.get_source_chroot(build_id).result_url
+    result = []
+
+    result.append(
+        Log(url=srpm_log_url if srpm_log_url else None)
+    )
+
+    for chroot in chroots:
+        result.extend(
+            Log(url=f"{result_url.rstrip('/')}/{name}")
+            for name in LOG_FILES
+            if (result_url := getattr(chroot, "result_url", None))
         )
-        for chroot in chroots
-    ]
+
+    result.append(
+        Log(
+            url=f"{dist_git_base}/{build_id}.log"
+            if (dist_git_base := COPR_DIST_GIT_LOGS_URL.rstrip("/"))
+            else None,
+        )
+    )
+
+    return result
 
 
 def _fetch_log_content(log_url: str) -> str:
     """Fetch log content from URL."""
     response = httpx.get(log_url, follow_redirects=True, timeout=30)
-    response.raise_for_status()
     return response.content.decode("utf-8", errors="replace")
 
 
@@ -260,17 +275,10 @@ def _format_log_output(text: str, max_lines: int = LOG_TAIL_LINES) -> str:
     )
 
 
-def copr_get_build_log(log_url: str | None) -> str:
+def copr_get_build_log(log_url: str) -> str:
     """
-    Fetch and return the decompressed text content of a builder-live.log.gz
-    file given its URL.
+    Fetch and return the text content of any Copr build log URL.
     """
-    if not log_url:
-        return (
-            "No log URL available. "
-            "The build chroot may not have started yet."
-        )
-
     log.debug("copr_get_build_log: %s", log_url)
     return _format_log_output(_fetch_log_content(log_url))
 
